@@ -43,21 +43,28 @@ class CausalSelfAttention(nn.Module):
         # k.transpose(-2, -1) --> will become [B, Nh, C//Nh, T]
         # q is [B, Nh, T, C//Nh]
         # att is [B, Nh, T, T] (after matrix mul)
-        att = (q @ k.transpose(-2, -1)) * (1.0/math.sqrt(k.size(-1)))
+        #att = (q @ k.transpose(-2, -1)) * (1.0/math.sqrt(k.size(-1)))
         
         # masked_fill will set the upper triangle of the matrix to 'inf'
         # What this means is that during training - only token occuring
         # before are paid attention to and future tokens are ignored.
         # This is called auto-regressive attention.
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        #att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
 
         # softmax - Not quite sure if I understand this part correctly
         # softmax seems to be getting applied across the heads (where as )
         # I always thought that should be applied across the context length (T)
-        att = F.softmax(att, dim=-1)
+        #att = F.softmax(att, dim=-1)
 
         # y would be [B, Nh, T, C//Nh]
-        y = att @ v
+        #y = att @ v
+
+        #  Optimization 3 - Flash Attention Optimization - Reduces the memor required for calculating
+        # attention dramatically as it fused the 4 line of attention above in one
+        # and also computes in online fashion on smaller chunks of memory.
+        # Reduced the training loop time by 27%, while maintaing the same accuracy. 
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         # y.transpose would be [B, T, Nh, C//Nh]
         # contiguous.view will concatenate the C//Nh dimension across Nh 
         # making it C so y would be [B, T, C]
@@ -261,7 +268,11 @@ class DataLoaderLite:
 
 
 #model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+# Optimization 4 - nice number roundup for vocabsize
+# 50304 can be divided by 2,4,8,16,128 so works better
+# with cuda. The extra padded tokens, the model learns to 
+# drive their probabilities to zero. Gives 4 to 30% improvement.
+model = GPT(GPTConfig(vocab_size=50304))
 print('did not crash yay!!!')
 
 # Optimization 2 - Use torch.compile - Torch compile compiles
