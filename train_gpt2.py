@@ -236,7 +236,6 @@ if torch.cuda.is_available():
 # elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 #     device = "mps"
 # MPS onmy laptop is 4x slower then CPU.
-print(torch.backends)
 print(f"using device :{device}")
 
 import tiktoken
