@@ -263,6 +263,20 @@ class DataLoaderLite:
 #model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
 print('did not crash yay!!!')
+
+# Optimization 2 - Use torch.compile - Torch compile compiles
+# the model and eliminate python overhead and also optimized 
+# GPU read/writes. The compile increase the compilation time but
+# reduces the training time (expected 50% reduction). Torch compile
+# can see the entire DAG of the model and then can optimize it so that
+# operations can be fused together (kernel fusion). For example if there 
+# are 4 different operations happening on an input (elemnetwise raise, then 
+# scaler multiplication, then addition back into input etc), without torch.compile
+# the python interpreter will run each of them in sequence which would
+# copy input and intermediate outputs multiple times between memory and GPU
+# thread memory and registers. With torch.compile that memory is only copied
+# once and then all the operations are fused together. 
+model = torch.compile(model)
 model.to(device)
 
 train_loader = DataLoaderLite(B=16, T=1024)
@@ -275,7 +289,17 @@ for i in range(50):
     x , y = train_loader.next_batch()
     x = x.to(device)
     y = y.to(device)
-    logits, loss = model(x, y)
+
+    # Optimization 1 - Mixed precision training
+    # use bfloat16 instead of float32 for activations etc
+    # Autocast automatically decides which parameters to use
+    # float16 for (mostly for linear layer) and which one to keep
+    # float32 (gradient accumulation etc)
+    # this makes operations lile mat mul faster. The expected
+    # improved is about 3 to 4x reduction in the training time and
+    # corresponding improvement in the token per second throughput.
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
     #torch.cuda.synchronize()
