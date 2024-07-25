@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import inspect
 
 class CausalSelfAttention(nn.Module):
 
@@ -174,6 +175,33 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
+    
+    def configure_optimizer(self, weight_decay, learning_rate, betas, device):
+        # start with all the parameters that requires grad
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items if p.dim() < 2]
+
+        optim_groups = [
+            {'params': decay_params, 'weight_decay':weight_decay},
+            {'params': nodecay_params, 'weight_decay':0.0}
+        ]
+
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+        return optimizer
+
+
 
 
     # Copied as is from the github repo (https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py)
@@ -289,13 +317,30 @@ print('did not crash yay!!!')
 model = torch.compile(model)
 model.to(device)
 
+# Optimization 7 - Learning Rate scheduler - Cosine with warmup
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr * (it + 1)/warmup_steps
+    if it > max_steps:
+        return min_lr
+    decay_ratio = (it - warmup_steps)/(max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
 train_loader = DataLoaderLite(B=16, T=1024)
 
 # Optimization 5 - Hyperparameter based on the GPT3 paper (since GPT2 paper
 # does not have these details). Set the betas and epsilons
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, betas=(0.9, 0.95), device=device)
 # Training loop
-for i in range(50):
+for step in range(max_steps):
     t1 = time.time()
     optimizer.zero_grad()
     x , y = train_loader.next_batch()
@@ -316,6 +361,10 @@ for i in range(50):
     # Optimization 6 - Clipping Gradients
     loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # Set the learning rate 
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t2 = time.time()
