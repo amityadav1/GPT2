@@ -291,7 +291,9 @@ model.to(device)
 
 train_loader = DataLoaderLite(B=16, T=1024)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# Optimization 5 - Hyperparameter based on the GPT3 paper (since GPT2 paper
+# does not have these details). Set the betas and epsilons
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 # Training loop
 for i in range(50):
     t1 = time.time()
@@ -310,12 +312,15 @@ for i in range(50):
     # corresponding improvement in the token per second throughput.
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
+
+    # Optimization 6 - Clipping Gradients
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
-    #torch.cuda.synchronize()
+    torch.cuda.synchronize()
     t2 = time.time()
-    dt = (t2 - t1) * 1000
-    print(f"for step {i}, loss {loss.item()}, time {dt} milliseconds")
+    dt = (t2 - t1)
+    print(f"for step {i:4d} | loss {loss.item():.6f} | norm {norm:.4f} |time {dt*1000} ms")
 
 import sys
 sys.exit(0)
