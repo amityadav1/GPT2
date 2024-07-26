@@ -9,6 +9,7 @@ import time
 import os
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from dataloaderlite import DataLoaderLite
 
 
 class CausalSelfAttention(nn.Module):
@@ -297,33 +298,6 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 
-#Simple Data Loader Class
-class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
-    # Load data from the tinyshakesphere data downloaded into input.txt file
-        with open("input.txt", 'r') as file:
-            text = file.read()
-        enc = tiktoken.get_encoding("gpt2")
-        self.tokens = torch.tensor(enc.encode(text))
-    
-        self.B = B
-        self.T = T
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.current_position = self.B * self.T * self.process_rank
-        # print(f"DataLoader Init: Num tokens: {len(self.tokens)}")
-        # print(f"DataLoader Init: Num Batches: {len(self.tokens) // (self.B  * self.T)}")
-    
-    def next_batch(self):
-        B, T = self.B, self.T
-        buf = self.tokens[self.current_position:self.current_position + B * T + 1]
-        x = (buf[:-1]).view(B, T)
-        y = (buf[1:]).view(B, T)
-        self.current_position += (B * T * self.num_processes)
-        if self.current_position + (B * T * self.num_processes + 1) >= len(self.tokens):
-            self.current_position = B * T * self.process_rank
-        return x, y
-
 # Optimization 8 - Large Batch size 
 # GPT3 uses 0.5 million tokens, so we should use the same, 
 # This would increase the throughput, although the training time for
@@ -341,7 +315,7 @@ if master_process:
     print(f"Total desired batch size {total_batch_size}")
     print(f"==> calculated gradient accumlation steps {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_local_rank, num_processes=ddp_world_size)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_local_rank, num_processes=ddp_world_size, split='train', datadir="edu_fineweb10B", master_process=master_process)
 torch.set_float32_matmul_precision('high')
 
 #model = GPT.from_pretrained('gpt2')
