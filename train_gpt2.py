@@ -8,7 +8,7 @@ import tiktoken
 import time
 import os
 from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as ddp
+import torch.distributed as dist
 
 
 class CausalSelfAttention(nn.Module):
@@ -182,7 +182,7 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
     
-    def configure_optimizer(self, weight_decay, learning_rate, betas, device):
+    def configure_optimizer(self, weight_decay, learning_rate, betas, device, master_process):
         # start with all the parameters that requires grad
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
@@ -197,14 +197,16 @@ class GPT(nn.Module):
 
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device == 'cuda'
+        use_fused = fused_available and device.startswith('cuda')
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
         return optimizer
 
     # Copied as is from the github repo (https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py)
@@ -287,8 +289,8 @@ else:
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = "mps"
 
-
-print(f"using device :{device}")
+if master_process:
+    print(f"using device :{device}")
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -309,8 +311,8 @@ class DataLoaderLite:
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.current_position = self.B * self.T * self.process_rank
-        print(f"DataLoader Init: Num tokens: {len(self.tokens)}")
-        print(f"DataLoader Init: Num Batches: {len(self.tokens) // (self.B  * self.T)}")
+        # print(f"DataLoader Init: Num tokens: {len(self.tokens)}")
+        # print(f"DataLoader Init: Num Batches: {len(self.tokens) // (self.B  * self.T)}")
     
     def next_batch(self):
         B, T = self.B, self.T
@@ -329,7 +331,8 @@ class DataLoaderLite:
 # however that will requires a lot many GPUs. so we would instead
 # do a series of micro batches and do graident accumulation
 total_batch_size = 2**19
-print(total_batch_size)
+if master_process:
+    print(total_batch_size)
 B = 16
 T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure the total batch size is divisible by B * T * ddp_world_size"
@@ -388,7 +391,7 @@ def get_lr(it):
 # Optimization 5 - Hyperparameter based on the GPT3 paper (since GPT2 paper
 # does not have these details). Set the betas and epsilons
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, betas=(0.9, 0.95), device=device)
+optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, betas=(0.9, 0.95), device=device, master_process=master_process)
 # Training loop
 for step in range(max_steps):
     t1 = time.time()
