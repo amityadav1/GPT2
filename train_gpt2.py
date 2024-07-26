@@ -338,7 +338,7 @@ if master_process:
     print(f"Total desired batch size {total_batch_size}")
     print(f"==> calculated gradient accumlation steps {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=process_rank, num_processes=num_processes)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_local_rank, num_processes=ddp_world_size)
 torch.set_float32_matmul_precision('high')
 
 #model = GPT.from_pretrained('gpt2')
@@ -363,6 +363,7 @@ model = GPT(GPTConfig(vocab_size=50304))
 # once and then all the operations are fused together. 
 model = torch.compile(model)
 model.to(device)
+raw_model = model
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
@@ -387,7 +388,7 @@ def get_lr(it):
 # Optimization 5 - Hyperparameter based on the GPT3 paper (since GPT2 paper
 # does not have these details). Set the betas and epsilons
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, betas=(0.9, 0.95), device=device)
+optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, betas=(0.9, 0.95), device=device)
 # Training loop
 for step in range(max_steps):
     t1 = time.time()
