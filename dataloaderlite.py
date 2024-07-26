@@ -26,22 +26,24 @@ class DataLoaderLite:
         shards = sorted(shards)
         shards = [os.path.join(data_root, s) for s in shards]
         self.shards = shards
+        self.master_process = master_process
         assert len(shards) > 0, f"no shards found for {split}"
-        if master_process:
+        if self.master_process:
             print(f"Loaded {len(shards)} shards")
-
-        self.current_shard_index = 0
-        self.current_position = self.B * self.T * self.process_rank
-        self.tokens = self.load_token(self.shards[self.current_shard_index])
-        
+        self.reset()
         # print(f"DataLoader Init: Num tokens: {len(self.tokens)}")
         # print(f"DataLoader Init: Num Batches: {len(self.tokens) // (self.B  * self.T)}")
 
-    def load_token(filename):
+    def load_token(self, filename):
         npt = np.load(filename)
-        ptt = torch.tensor(np, dtype=torch.long)
+        ptt = torch.tensor(npt, dtype=torch.long)
         return ptt
     
+    def reset(self):
+        self.current_shard_index = 0
+        self.current_position = self.B * self.T * self.process_rank
+        self.tokens = self.load_token(self.shards[self.current_shard_index])
+
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position:self.current_position + B * T + 1]
@@ -50,5 +52,8 @@ class DataLoaderLite:
         self.current_position += (B * T * self.num_processes)
         if self.current_position + (B * T * self.num_processes + 1) >= len(self.tokens):
             self.current_shard_index = (self.current_shard_index + 1) % len(self.shards)
+            self.tokens = self.load_token(self.shards[self.current_shard_index])
             self.current_position = B * T * self.process_rank
+            if self.master_process:
+                print(f"Will loading at {self.current_position} from {self.shards[self.current_shard_index]}")
         return x, y
