@@ -11,7 +11,33 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from dataloaderlite import DataLoaderLite
 from model import GPT, GPTConfig
+from hellaswag import render_example, iterate_examples
 
+
+#-------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# helper function for HellaSwag eval
+# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
+
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
 
 #-------------------------------------------------------------------------------
 
@@ -122,7 +148,7 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, betas=(0.9, 0.95), device=device, master_process=master_process)
 
 log_dir = "log"
-os.mkdir(log_dir, exist_ok=True)
+os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"logs.txt")
 with open(log_file, 'w') as file:
     pass
@@ -150,10 +176,24 @@ for step in range(max_steps):
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
             if master_process:
                 print(f"validation loss {val_loss_accum.item():0.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                if step > 0 and (step % 250 == 0 or last_step):
+                    # optionally write model checkpoints
+                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'config': raw_model.config,
+                        'step': step,
+                        'val_loss': val_loss_accum.item()
+                    }
+                    # you might also want to add optimizer.state_dict() and
+                    # rng seeds etc., if you wanted to more exactly resume training
+                    torch.save(checkpoint, checkpoint_path)
     
 
     # Evaluation loop using helloswag
-    if (step % 250 == 0 or last_step) and (not use_compile):
+    if (step % 250 == 0 or last_step):
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate(iterate_examples("val")):
@@ -166,7 +206,7 @@ for step in range(max_steps):
             mask = mask.to(device)
             # get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
                     logits, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
@@ -186,7 +226,7 @@ for step in range(max_steps):
                 f.write(f"{step} hella {acc_norm:.4f}\n")
 
     # Inference Sampling
-    if step % 100 == 0:
+    if (step % 250  == 0 or last_step):
         model.eval()
         num_return_sequence = 4
         max_length = 32
@@ -275,12 +315,11 @@ for step in range(max_steps):
     token_per_second = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size)/dt
     if master_process:
         print(f"for step {step:4d} | loss {loss_accum:.6f} | norm {norm:.4f} | time {dt*1000:0.4f} ms | tok/sec {token_per_second:0.4f}")
-
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 if ddp:
     destroy_process_group()
-import sys
-sys.exit(0)
 
 
 
