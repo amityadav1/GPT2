@@ -182,7 +182,7 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items if p.dim() < 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
 
         optim_groups = [
             {'params': decay_params, 'weight_decay':weight_decay},
@@ -369,7 +369,7 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t2 = time.time()
     dt = (t2 - t1)
-    print(f"for step {i:4d} | loss {loss.item():.6f} | norm {norm:.4f} |time {dt*1000} ms")
+    print(f"for step {step:4d} | loss {loss.item():.6f} | norm {norm:.4f} |time {dt*1000} ms")
 
 import sys
 sys.exit(0)
