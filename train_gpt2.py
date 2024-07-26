@@ -57,7 +57,7 @@ if torch.cuda.is_available():
 total_batch_size = 2**19
 if master_process:
     print(total_batch_size)
-B = 32
+B = 16
 T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure the total batch size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -89,7 +89,7 @@ model = GPT(GPTConfig(vocab_size=50304))
 # copy input and intermediate outputs multiple times between memory and GPU
 # thread memory and registers. With torch.compile that memory is only copied
 # once and then all the operations are fused together. 
-model = torch.compile(model)
+#model = torch.compile(model)
 model.to(device)
 raw_model = model
 if ddp:
@@ -120,12 +120,20 @@ def get_lr(it):
 # does not have these details). Set the betas and epsilons
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, betas=(0.9, 0.95), device=device, master_process=master_process)
+
+log_dir = "log"
+os.mkdir(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"logs.txt")
+with open(log_file, 'w') as file:
+    pass
+
 # Training loop
 for step in range(max_steps):
     t1 = time.time()
+    last_step = (step == max_steps - 1)
 
     # Evaluation loop
-    if step % 100 == 0:
+    if (step % 250 == 0 or last_step):
         val_loader.reset()
         model.eval()
         with torch.no_grad():
@@ -143,11 +151,45 @@ for step in range(max_steps):
             if master_process:
                 print(f"validation loss {val_loss_accum.item():0.4f}")
     
+
+    # Evaluation loop using helloswag
+    if (step % 250 == 0 or last_step) and (not use_compile):
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # only process examples where i % ddp_world_size == ddp_rank
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # render the example into tokens and labels
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            # get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
+
     # Inference Sampling
-    if step > 0 and step % 100 == 0:
+    if step % 100 == 0:
         model.eval()
-        num_return_sequence = 5
-        max_length = 30
+        num_return_sequence = 4
+        max_length = 32
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode("Hello, I'm a language model,")
         tokens = torch.tensor(tokens, dtype=torch.long) # (8, )
@@ -160,7 +202,8 @@ for step in range(max_steps):
 
             #forward the model to get the logits
             with torch.no_grad():
-                logits = model(x)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(xgen)
 
                 # take the logits at the last col
                 logits = logits[:, -1, :] #(B, T, vocab_size) 
