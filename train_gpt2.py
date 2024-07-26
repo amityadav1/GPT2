@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import inspect
+import tiktoken
+import time
 
 class CausalSelfAttention(nn.Module):
 
@@ -201,9 +203,6 @@ class GPT(nn.Module):
         print(f"using fused AdamW: {use_fused}")
         return optimizer
 
-
-
-
     # Copied as is from the github repo (https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py)
     # This function basically loads GPT2 model weights from hugging face into our GPT class.
     @classmethod
@@ -266,8 +265,10 @@ if torch.cuda.is_available():
 # MPS onmy laptop is 4x slower then CPU.
 print(f"using device :{device}")
 
-import tiktoken
-import time
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
 
 #Simple Data Loader Class
 class DataLoaderLite:
@@ -293,6 +294,19 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 
+# GPT3 uses 0.5 million tokens, so we should use the same.
+# however that will requires a lot many GPUs. so we would instead
+# do a series of micro batches and do graident accumulation
+total_batch_size = 2**19
+print(total_batch_size)
+B = 16
+T = 1024
+assert total_batch_size % (B * T) == 0, "make sure the total batch size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"Total desired batch size {total_batch_size}")
+print(f"==> calculated gradient accumlation steps {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T)
 
 #model = GPT.from_pretrained('gpt2')
 # Optimization 4 - nice number roundup for vocabsize
@@ -333,7 +347,7 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
 
-train_loader = DataLoaderLite(B=16, T=1024)
+
 
 # Optimization 5 - Hyperparameter based on the GPT3 paper (since GPT2 paper
 # does not have these details). Set the betas and epsilons
@@ -343,23 +357,27 @@ optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, beta
 for step in range(max_steps):
     t1 = time.time()
     optimizer.zero_grad()
-    x , y = train_loader.next_batch()
-    x = x.to(device)
-    y = y.to(device)
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x , y = train_loader.next_batch()
+        x = x.to(device)
+        y = y.to(device)
 
-    # Optimization 1 - Mixed precision training
-    # use bfloat16 instead of float32 for activations etc
-    # Autocast automatically decides which parameters to use
-    # float16 for (mostly for linear layer) and which one to keep
-    # float32 (gradient accumulation etc)
-    # this makes operations lile mat mul faster. The expected
-    # improved is about 3 to 4x reduction in the training time and
-    # corresponding improvement in the token per second throughput.
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
+        # Optimization 1 - Mixed precision training
+        # use bfloat16 instead of float32 for activations etc
+        # Autocast automatically decides which parameters to use
+        # float16 for (mostly for linear layer) and which one to keep
+        # float32 (gradient accumulation etc)
+        # this makes operations lile mat mul faster. The expected
+        # improved is about 3 to 4x reduction in the training time and
+        # corresponding improvement in the token per second throughput.
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
 
-    # Optimization 6 - Clipping Gradients
-    loss.backward()
+        # Optimization 6 - Clipping Gradients
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # Set the learning rate 
     lr = get_lr(step)
@@ -369,7 +387,8 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t2 = time.time()
     dt = (t2 - t1)
-    print(f"for step {step:4d} | loss {loss.item():.6f} | norm {norm:.4f} |time {dt*1000} ms")
+    token_per_second = (train_loader.B * train_loader.T * grad_accum_steps)/dt
+    print(f"for step {step:4d} | loss {loss_accum:.6f} | norm {norm:.4f} | time {dt*1000:0.4f} ms | tok/sec {token_per_second}")
 
 import sys
 sys.exit(0)
